@@ -24,9 +24,9 @@ import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import path from 'path';
-import { mkdirSync, readFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmdirSync, statSync, unlinkSync } from 'fs';
 import { fileURLToPath } from 'url';
-import { randomBytes, createHash } from 'crypto';
+import { randomBytes, createHash, timingSafeEqual } from 'crypto';
 import { execFileSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
@@ -86,6 +86,10 @@ const SEND_READ_RECEIPTS =
 
 const PORT = parseInt(getArg('port', '3000'), 10);
 const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
+const REACTION_LOG_PATH = process.env.HERMES_WHATSAPP_REACTION_LOG
+  || path.join(process.env.HERMES_HOME || path.join(process.env.HOME || '~', '.hermes'), 'data', 'whatsapp-reactions.jsonl');
+const REACTION_LOG_LOCK_PATH = `${REACTION_LOG_PATH}.lock`;
+
 // Cache directories: the Python gateway passes the profile-aware paths via
 // env (HERMES_HOME-aware, new cache/ layout).  Fall back to the legacy
 // hardcoded locations for bridges launched outside the gateway.
@@ -388,6 +392,42 @@ function rememberSentId(id) {
 let sock = null;
 let connectionState = 'disconnected';
 
+// HERMES_GROUP_METADATA_CACHE_V1: Baileys 7 group sends can receive LID-first participant
+// metadata whose `id` is not directly usable for device fan-out. Prefer the
+// paired phone JID when groupMetadata exposes it, and keep the cache short.
+const groupMetadataCache = new Map();
+const GROUP_METADATA_CACHE_MS = 5 * 60 * 1000;
+
+function normalizeGroupMetadataForSend(metadata) {
+  if (!metadata || !Array.isArray(metadata.participants)) return metadata;
+  return {
+    ...metadata,
+    participants: metadata.participants.map(participant => ({
+      ...participant,
+      id: participant.jid || participant.phoneNumber || participant.id,
+    })),
+  };
+}
+
+async function cachedGroupMetadataForSend(jid) {
+  const cached = groupMetadataCache.get(jid);
+  if (cached && cached.expiresAt > Date.now()) return cached.metadata;
+  if (!sock) return undefined;
+  const metadata = normalizeGroupMetadataForSend(await sock.groupMetadata(jid));
+  // HERMES_GROUP_METADATA_SHAPE_V1: emit field names only; never IDs or values.
+  console.warn(JSON.stringify({
+    event: 'whatsapp_group_metadata_shape',
+    addressingMode: metadata?.addressingMode || null,
+    participantCount: metadata?.participants?.length || 0,
+    participantKeys: [...new Set((metadata?.participants || []).flatMap(item => Object.keys(item)))].sort(),
+  }));
+  groupMetadataCache.set(jid, {
+    metadata,
+    expiresAt: Date.now() + GROUP_METADATA_CACHE_MS,
+  });
+  return metadata;
+}
+
 function emitPairEvent(event) {
   if (!PAIR_JSON) return;
   try {
@@ -397,6 +437,35 @@ function emitPairEvent(event) {
 
 const scheduleReconnect = createReconnectScheduler(() => startSocket());
 const getWAVersion = createVersionResolver(fetchLatestBaileysVersion);
+
+// HERMES_REACTION_PATCH_V2: cooperate with the PagerDuty watcher while it
+// atomically rotates the active JSONL file. The lock is only held around one
+// synchronous append, so reactions are never dropped during maintenance.
+async function persistReactionEvent(event) {
+  while (true) {
+    try {
+      mkdirSync(REACTION_LOG_LOCK_PATH, { mode: 0o700 });
+      break;
+    } catch (err) {
+      if (err?.code !== 'EEXIST') throw err;
+      try {
+        if (Date.now() - statSync(REACTION_LOG_LOCK_PATH).mtimeMs > 300000) {
+          rmdirSync(REACTION_LOG_LOCK_PATH);
+          continue;
+        }
+      } catch (statErr) {
+        if (statErr?.code !== 'ENOENT') throw statErr;
+      }
+      await sleep(25);
+    }
+  }
+  try {
+    mkdirSync(path.dirname(REACTION_LOG_PATH), { recursive: true });
+    appendFileSync(REACTION_LOG_PATH, `${JSON.stringify(event)}\n`, { mode: 0o600 });
+  } finally {
+    try { rmdirSync(REACTION_LOG_LOCK_PATH); } catch {}
+  }
+}
 
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
@@ -410,6 +479,7 @@ async function startSocket() {
     browser: ['Hermes Agent', 'Chrome', '120.0'],
     syncFullHistory: false,
     markOnlineOnConnect: false,
+    cachedGroupMetadata: async (jid) => cachedGroupMetadataForSend(jid),
     // Required for Baileys 7.x: without this, incoming messages that need
     // E2EE session re-establishment are silently dropped (msg.message === null)
     getMessage: async (key) => {
@@ -526,6 +596,33 @@ async function startSocket() {
         aggregation,
       });
       enqueuePollUpdateEvent({ key, update: { ...update, pollUpdates }, selectedOptions, aggregation });
+    }
+  });
+
+  // Persist reactions separately from the normal inbound-message queue. This
+  // gives narrow automations a durable message-id correlation channel without
+  // weakening the gateway's group mention policy or racing its /messages poll.
+  sock.ev.on('messages.reaction', async (reactions) => {
+    for (const item of reactions || []) {
+      const targetKey = item?.key || {};
+      const reaction = item?.reaction || {};
+      const reactionKey = reaction?.key || {};
+      const chatId = normalizeWhatsAppId(targetKey.remoteJid || reactionKey.remoteJid || '');
+      const targetMessageId = String(targetKey.id || '');
+      if (!chatId || !targetMessageId) continue;
+      const event = {
+        eventId: String(reactionKey.id || `${targetMessageId}:${Date.now()}`),
+        chatId,
+        targetMessageId,
+        reactorId: normalizeWhatsAppId(reactionKey.participant || reactionKey.remoteJid || ''),
+        reaction: String(reaction.text || ''),
+        timestamp: Math.floor(Date.now() / 1000),
+      };
+      try {
+        await persistReactionEvent(event);
+      } catch (err) {
+        console.warn('[bridge] failed to persist reaction event:', err.message);
+      }
     }
   });
 
@@ -778,9 +875,35 @@ async function startSocket() {
   });
 }
 
-// HTTP server
+// Private Family delivery is authenticated at the local bridge because the
+// Tailscale proxy is intentionally a transport relay, not an authorization
+// boundary. Keep the destination and token in a mode-0600 local file.
+const FAMILY_DELIVERY_CONFIG_PATH = path.join(
+  process.env.HOME || '/home/john',
+  '.hermes',
+  'secrets',
+  'family-delivery.json',
+);
+function loadFamilyDeliveryConfig() {
+  try {
+    const config = JSON.parse(readFileSync(FAMILY_DELIVERY_CONFIG_PATH, 'utf8'));
+    if (typeof config.chatId !== 'string' || typeof config.token !== 'string') {
+      return null;
+    }
+    return config;
+  } catch {
+    return null;
+  }
+}
+function hasFamilyDeliveryToken(value, expected) {
+  if (typeof value !== 'string' || !expected) return false;
+  const actual = Buffer.from(value);
+  const target = Buffer.from(expected);
+  return actual.length === target.length && timingSafeEqual(actual, target);
+}
+
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
 
 // Host-header validation — defends against DNS rebinding.
 // The bridge binds loopback-only (127.0.0.1) but a victim browser on
@@ -854,7 +977,76 @@ app.post('/send', async (req, res) => {
       messageIds,
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    // HERMES_SEND_STACK_DIAGNOSTIC_V1: paths and line numbers only. Request
+    // values, chat IDs, message text, credentials and metadata are omitted.
+    const diagnostic = String(err?.stack || '')
+      .split('\n')
+      .slice(0, 10)
+      .map(line => line.replace(/\/home\/john\/\.hermes\/[^: )]+/g, '<bridge>'));
+    res.status(500).json({ error: err.message, diagnostic });
+  }
+});
+
+// Authenticated fixed-destination Family delivery for callers arriving through
+// the private Tailscale proxy. It accepts the Home Assistant contract
+// {message, image_base64?} without exposing a chat ID outside Hermes.
+app.post('/send-family', async (req, res) => {
+  const config = loadFamilyDeliveryConfig();
+  if (!config || !hasFamilyDeliveryToken(req.headers['x-family-delivery-token'], config.token)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+
+  const { message, image_base64: imageBase64 } = req.body;
+  if (typeof message !== 'string' || !message) {
+    return res.status(400).json({ error: 'message is required' });
+  }
+  try {
+    if (imageBase64) {
+      const encoded = String(imageBase64).replace(/^data:image\/jpeg;base64,/, '');
+      if (
+        encoded.length > 2_000_000
+        || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)
+      ) {
+        return res.status(400).json({ error: 'Invalid image' });
+      }
+      const image = Buffer.from(encoded, 'base64');
+      if (
+        image.length < 4
+        || image.length > 1_500_000
+        || image[0] !== 0xff
+        || image[1] !== 0xd8
+        || image[2] !== 0xff
+      ) {
+        return res.status(400).json({ error: 'Invalid image' });
+      }
+      const sent = await sendWithTimeout(config.chatId, {
+        image,
+        caption: formatOutgoingMessage(message),
+        mimetype: 'image/jpeg',
+      });
+      trackSentMessageId(sent);
+      messageStore.remember(sent);
+      return res.json({ success: true, messageId: sent?.key?.id });
+    }
+
+    const chunks = splitLongMessage(formatOutgoingMessage(message));
+    const messageIds = [];
+    for (const chunk of chunks) {
+      const { content: payload, options } = buildTextSendPayload(chunk, {
+        chatId: config.chatId,
+        messageStore,
+      });
+      const sent = await sendWithTimeout(config.chatId, payload, options);
+      trackSentMessageId(sent);
+      messageStore.remember(sent);
+      if (sent?.key?.id) messageIds.push(sent.key.id);
+    }
+    return res.json({ success: true, messageId: messageIds.at(-1), messageIds });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
   }
 });
 
