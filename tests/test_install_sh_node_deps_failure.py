@@ -21,6 +21,7 @@ def _run_node_deps_stage(
     tmp_path: Path,
     *,
     fail_directory: str | None,
+    enotempty_once_directory: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], Path, list[str]]:
     install_dir = tmp_path / "install"
     tui_dir = install_dir / "ui-tui"
@@ -53,6 +54,12 @@ if [ -n "${NPM_FAIL_DIRECTORY:-}" ] && [ "$PWD" = "$NPM_FAIL_DIRECTORY" ]; then
     echo "simulated npm lifecycle failure" >&2
     exit 37
 fi
+if [ -n "${NPM_ENOTEMPTY_ONCE_DIRECTORY:-}" ] && [ "$PWD" = "$NPM_ENOTEMPTY_ONCE_DIRECTORY" ] && [ ! -f "$NPM_ENOTEMPTY_MARKER" ]; then
+    mkdir -p node_modules/eslint
+    touch "$NPM_ENOTEMPTY_MARKER"
+    echo "npm error code ENOTEMPTY" >&2
+    exit 39
+fi
 exit 0
 """,
     )
@@ -65,6 +72,8 @@ exit 0
             "HERMES_INSTALL_DIR": str(install_dir),
             "NPM_CALLS": str(npm_calls),
             "NPM_FAIL_DIRECTORY": fail_directory or "",
+            "NPM_ENOTEMPTY_ONCE_DIRECTORY": enotempty_once_directory or "",
+            "NPM_ENOTEMPTY_MARKER": str(tmp_path / "enotempty-once"),
             "PATH": f"{bin_dir}:{env['PATH']}",
         }
     )
@@ -143,3 +152,17 @@ def test_node_dependency_success_remains_successful(tmp_path: Path) -> None:
     assert calls == [str(install_dir), str(install_dir / "ui-tui")]
     assert "Node.js dependencies installed" in proc.stdout
     assert "TUI dependencies installed" in proc.stdout
+
+
+def test_stale_node_modules_is_rebuilt_once_on_enotempty(tmp_path: Path) -> None:
+    install_dir = tmp_path / "install"
+    proc, _, calls = _run_node_deps_stage(
+        tmp_path,
+        fail_directory=None,
+        enotempty_once_directory=str(install_dir),
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert calls == [str(install_dir), str(install_dir), str(install_dir / "ui-tui")]
+    assert "rebuilding node_modules once" in proc.stdout
+    assert "Node.js dependencies installed" in proc.stdout

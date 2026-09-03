@@ -2401,6 +2401,35 @@ configure_browser_env_from_system_browser() {
     log_success "Configured browser tools to use $browser_path"
 }
 
+npm_install_with_enotempty_recovery() {
+    local dependency_dir="$1"
+    local npm_log="$2"
+
+    if run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --loglevel=warn \
+            >"$npm_log" 2>&1; then
+        return 0
+    fi
+
+    # npm can leave an old package beside its dot-prefixed rename target when
+    # upgrading a pre-workspaces install. A second install then fails with
+    # ENOTEMPTY before it can repair either directory. node_modules is wholly
+    # generated state, so clear it and retry once. Other failures retain their
+    # original diagnostic and do not take this recovery path.
+    if grep -q 'npm error code ENOTEMPTY' "$npm_log" \
+            && [ -n "$dependency_dir" ] \
+            && [ -f "$dependency_dir/package.json" ] \
+            && [ -d "$dependency_dir/node_modules" ]; then
+        log_warn "npm found stale generated dependencies; rebuilding node_modules once..."
+        rm -rf -- "$dependency_dir/node_modules"
+        : >"$npm_log"
+        run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --loglevel=warn \
+            >"$npm_log" 2>&1
+        return $?
+    fi
+
+    return 1
+}
+
 install_node_deps() {
     if [ "$HAS_NODE" = false ]; then
         log_info "Skipping Node.js dependencies (Node not installed)"
@@ -2425,8 +2454,7 @@ install_node_deps() {
         # Capture npm output so failures are diagnosable (#87340).
         local npm_log
         npm_log="$(mktemp)"
-        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --loglevel=warn \
-                >"$npm_log" 2>&1; then
+        if ! npm_install_with_enotempty_recovery "$INSTALL_DIR" "$npm_log"; then
             log_error "npm install failed or timed out; Node.js dependencies were not installed"
             if [ -s "$npm_log" ]; then
                 log_error "npm output:"
@@ -2541,8 +2569,7 @@ install_node_deps() {
         # Capture npm output so failures are diagnosable (#87340).
         local tui_npm_log
         tui_npm_log="$(mktemp)"
-        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --loglevel=warn \
-                >"$tui_npm_log" 2>&1; then
+        if ! npm_install_with_enotempty_recovery "$INSTALL_DIR/ui-tui" "$tui_npm_log"; then
             log_error "TUI npm install failed or timed out; TUI dependencies were not installed"
             if [ -s "$tui_npm_log" ]; then
                 log_error "npm output:"
